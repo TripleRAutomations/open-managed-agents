@@ -1147,6 +1147,16 @@ export async function buildTools(
         // credential injection + upstream fetch and returns the Response
         // verbatim (streaming).
         const proxyFetch: typeof globalThis.fetch = (input, init) => {
+          // workerd rejects redirect:"error" outright ("won't be implemented
+          // ... at the edge"), and the MCP SDK transport sets exactly that on
+          // its SSE stream requests — throwing inside new Request() and
+          // silently killing registration for every url MCP server on CF.
+          // Map it to "manual": our proxy targets never redirect, and a 3xx
+          // would fail the handshake either way.
+          if (init?.redirect === "error") init = { ...init, redirect: "manual" };
+          if (input instanceof Request && input.redirect === "error") {
+            input = new Request(input, { redirect: "manual" });
+          }
           const req = new Request(input, init);
           req.headers.set("x-oma-tenant", tenantId);
           req.headers.set("x-oma-session", sessionId);
@@ -1181,6 +1191,16 @@ export async function buildTools(
           console.error(
             `[mcp] cloud MCP setup failed for "${server.name}" (${server.url}): ${msg}`,
           );
+          // Also surface in-band: a silently missing MCP toolset is
+          // indistinguishable from an agent that just lacks tools, which
+          // makes production misconfigurations invisible. session.warning
+          // is already the channel for operational notices.
+          env.broadcastEvent?.({
+            type: "session.warning",
+            id: `sevt-${nanoid(12)}`,
+            processed_at: new Date().toISOString(),
+            message: `mcp_setup_failed server=${server.name} url=${server.url} error=${msg.slice(0, 300)}`,
+          } as never);
         } finally {
           clearTimeout(timeoutHandle);
         }
