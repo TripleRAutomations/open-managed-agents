@@ -168,7 +168,16 @@ export async function resolveProxyTargetByTenant(
           }
         | undefined;
       if (auth?.mcp_server_url !== server.url) continue;
-      const token = auth?.bearer_token ?? auth?.token ?? auth?.access_token;
+      // Injection preference is TYPE-AWARE. For mcp_oauth the rotated
+      // access_token must win: a credential converted from static_bearer
+      // via the merge-based update can retain a stale `token` field, and
+      // preferring it injects an expired bearer forever while refresh
+      // rotates access_token that is never read — and the refresh dedup
+      // (which compares access_token) then short-circuits real re-mints.
+      const token =
+        auth?.type === "mcp_oauth"
+          ? (auth.access_token ?? auth.bearer_token ?? auth.token)
+          : (auth?.bearer_token ?? auth?.token ?? auth?.access_token);
       if (!token) continue;
       const target: ProxyTarget = { upstreamUrl: server.url, upstreamToken: token };
       // Surface refresh metadata for mcp_oauth so 401 can trigger an
