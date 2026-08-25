@@ -4034,7 +4034,17 @@ export class SessionDO extends DurableObject<Env> {
       },
     });
     const subModelId = typeof subAgent.model === "string" ? subAgent.model : subAgent.model?.id;
-    const subModel = resolveModel(subModelId || this.env.ANTHROPIC_MODEL || "claude-sonnet-4-6", this.env.ANTHROPIC_API_KEY, this.env.ANTHROPIC_BASE_URL);
+    // Resolve through model cards exactly like the primary thread and
+    // resolveAuxModel do — the sub-agent's `model` is a card HANDLE
+    // (e.g. "soc-fast"), not necessarily a wire-level model id. Passing
+    // the handle straight to resolveModel with the env Anthropic key
+    // breaks every card-backed deployment's coordinators: the provider
+    // rejects the unknown model and the thread dies with "No output
+    // generated". Env fallback behavior is unchanged for handle-less
+    // deployments (resolveModelCardCredentials falls through to env).
+    const subHandle = subModelId || this.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
+    const subCreds = await this.resolveModelCardCredentials(subHandle);
+    const subModel = resolveModel(subCreds.model, subCreds.apiKey, subCreds.baseURL, subCreds.apiCompat, subCreds.customHeaders);
 
     // Per-thread abort controller. Registered in _threadAbortControllers
     // so a `user.interrupt` with this thread's session_thread_id (handled
