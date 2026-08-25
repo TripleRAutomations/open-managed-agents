@@ -128,11 +128,32 @@ export function resolveModel(
   const effectiveCompat = compat || "ant";
 
   if (useOpenAI(effectiveCompat)) {
+    // Cap max_tokens when the harness didn't set one. Two reasons:
+    // (1) gateways that reserve credits per in-flight request (OpenRouter)
+    //     size the reservation from worst-case output — uncapped 1M-context
+    //     reasoning models reserve dollars per call and starve concurrent
+    //     sessions into 402s long before actual spend reaches the balance;
+    // (2) a runaway generation is bounded. 16k is ample for tool-call turns
+    //     and final reports.
+    const capMaxTokensFetch = async (url: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      if (init?.body && typeof init.body === "string") {
+        try {
+          const body = JSON.parse(init.body);
+          if (body.max_tokens == null && body.max_completion_tokens == null) {
+            body.max_tokens = 16384;
+            init = { ...init, body: JSON.stringify(body) };
+          }
+        } catch {
+          /* non-JSON body — leave untouched */
+        }
+      }
+      return observingFetch(url, init);
+    };
     const openai = createOpenAI({
       apiKey,
       baseURL: baseURL || undefined,
       headers: customHeaders,
-      fetch: observingFetch,
+      fetch: capMaxTokensFetch,
     });
     // Use chat/completions endpoint, not Responses API.
     // Reasons:
