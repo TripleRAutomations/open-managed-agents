@@ -935,6 +935,10 @@ export interface CredentialAuth {
   token_endpoint?: string;
   client_id?: string;
   client_secret?: string;
+  // OAuth2 scope requested when re-minting via client_credentials (M2M
+  // servers with no refresh_token — e.g. Cognito app clients). Unused by
+  // the refresh_token grant.
+  scope?: string;
   expires_at?: string;           // ISO 8601, when access_token expires
   authorization_server?: string; // cached OAuth authorization server URL
   // static_bearer / cap_cli fields

@@ -227,6 +227,92 @@ describe("forwardWithRefresh — OAuth refresh on 401", () => {
     expect((live!.auth as { refresh_token: string }).refresh_token).toBe("refresh_v2");
   });
 
+  it("401 → client_credentials re-mint (no refresh_token) → retry → 200, client id/secret survive merge", async () => {
+    const { services, credService } = makeServices();
+    // M2M-shaped credential: no refresh_token — client id/secret + scope only
+    // (e.g. a Cognito app client, which never issues refresh tokens).
+    const cred = await credService.create({
+      tenantId: TENANT,
+      vaultId: VAULT,
+      displayName: "m2m cred",
+      auth: {
+        type: "mcp_oauth",
+        mcp_server_url: SERVER,
+        access_token: "expired-m2m-token",
+        token_endpoint: TOKEN_EP,
+        client_id: "m2m-client",
+        client_secret: "m2m-secret",
+        scope: "mcp-server/read",
+      } as never,
+    });
+
+    mock.restore();
+    mock = installFetchMock([
+      () =>
+        new Response('{"error":"unauthorized"}', {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        }),
+      // client_credentials grants return no refresh_token
+      () =>
+        new Response(JSON.stringify({ access_token: "fresh-m2m", expires_in: 86400 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      () =>
+        new Response('{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}', {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    ]);
+
+    const target = {
+      upstreamUrl: SERVER,
+      upstreamToken: "expired-m2m-token",
+      refresh: {
+        tokenEndpoint: TOKEN_EP,
+        clientId: "m2m-client",
+        clientSecret: "m2m-secret",
+        scope: "mcp-server/read",
+        credentialId: cred.id,
+        vaultId: VAULT,
+      },
+    };
+
+    const res = await forwardWithRefresh(
+      services,
+      TENANT,
+      target,
+      "POST",
+      new Headers({ "content-type": "application/json" }),
+      '{"jsonrpc":"2.0","id":1,"method":"initialize"}',
+      { sessionId: "sess_test", serverName: "test", callerKind: "rpc-mcp" },
+    );
+
+    expect(res.status).toBe(200);
+    expect(mock.calls).toHaveLength(3);
+    expect(mock.calls[1].url).toBe(TOKEN_EP);
+    expect(mock.calls[1].body).toContain("grant_type=client_credentials");
+    expect(mock.calls[1].body).toContain("client_id=m2m-client");
+    expect(mock.calls[1].body).toContain("client_secret=m2m-secret");
+    expect(mock.calls[1].body).toContain("scope=mcp-server%2Fread");
+    expect(mock.calls[1].body).not.toContain("refresh_token");
+    expect(mock.calls[2].headers.get("authorization")).toBe("Bearer fresh-m2m");
+
+    // Merge must preserve the re-mint bits for the NEXT expiry.
+    const live = await credService.get({
+      tenantId: TENANT,
+      vaultId: VAULT,
+      credentialId: cred.id,
+    });
+    const auth = live!.auth as Record<string, unknown>;
+    expect(auth.access_token).toBe("fresh-m2m");
+    expect(auth.client_id).toBe("m2m-client");
+    expect(auth.client_secret).toBe("m2m-secret");
+    expect(auth.scope).toBe("mcp-server/read");
+    expect(auth.refresh_token).toBeUndefined();
+  });
+
   it("dedup: second 401 sees already-refreshed credential in D1, skips token_endpoint", async () => {
     const { services, credService } = makeServices();
     const cred = await seedCred(credService, "expired-token");

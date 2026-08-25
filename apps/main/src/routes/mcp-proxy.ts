@@ -64,13 +64,18 @@ export interface ProxyTarget {
   /** Bearer token to inject on the upstream request. */
   upstreamToken: string;
   /** Set when the matched credential has the bits needed to refresh on
-   *  401 (refresh_token + token_endpoint). Used by `forwardWithRefresh`
-   *  to retry once with a fresh token if the upstream rejects the
-   *  bearer. Stays internal to main — never leaves through any RPC
-   *  return value or HTTP response body. */
+   *  401 — either refresh_token + token_endpoint (refresh_token grant),
+   *  or client_id + client_secret + token_endpoint with NO refresh_token
+   *  (client_credentials re-mint, for M2M-only OAuth servers such as
+   *  Cognito app clients). Used by `forwardWithRefresh` to retry once
+   *  with a fresh token if the upstream rejects the bearer. Stays
+   *  internal to main — never leaves through any RPC return value or
+   *  HTTP response body. */
   refresh?: {
-    refreshToken: string;
+    refreshToken?: string;
     tokenEndpoint: string;
+    /** Scope for the client_credentials re-mint; ignored for refresh_token. */
+    scope?: string;
     clientId?: string;
     clientSecret?: string;
     credentialId: string;
@@ -159,6 +164,7 @@ export async function resolveProxyTargetByTenant(
             token_endpoint?: string;
             client_id?: string;
             client_secret?: string;
+            scope?: string;
           }
         | undefined;
       if (auth?.mcp_server_url !== server.url) continue;
@@ -166,13 +172,22 @@ export async function resolveProxyTargetByTenant(
       if (!token) continue;
       const target: ProxyTarget = { upstreamUrl: server.url, upstreamToken: token };
       // Surface refresh metadata for mcp_oauth so 401 can trigger an
-      // automatic token refresh + retry. static_bearer creds skip this.
-      if (auth.type === "mcp_oauth" && auth.refresh_token && auth.token_endpoint) {
+      // automatic token refresh + retry. Two refreshable shapes:
+      //   - refresh_token + token_endpoint → refresh_token grant
+      //   - client_id + client_secret + token_endpoint (no refresh_token)
+      //     → client_credentials re-mint (M2M-only servers, e.g. Cognito)
+      // static_bearer creds skip this.
+      if (
+        auth.type === "mcp_oauth" &&
+        auth.token_endpoint &&
+        (auth.refresh_token || (auth.client_id && auth.client_secret))
+      ) {
         target.refresh = {
           refreshToken: auth.refresh_token,
           tokenEndpoint: auth.token_endpoint,
           clientId: auth.client_id,
           clientSecret: auth.client_secret,
+          scope: auth.scope,
           credentialId: (c as { id: string }).id,
           vaultId: g.vault_id,
         };
@@ -581,11 +596,20 @@ async function tryRefreshOauth(
     // D1 unreachable — fall through to token_endpoint refresh without CAS.
   }
 
-  const tokenBody = new URLSearchParams({
-    grant_type: "refresh_token",
-    refresh_token: refresh.refreshToken,
-    client_id: refresh.clientId || "open-managed-agents",
-  });
+  // Two grant shapes (see ProxyTarget.refresh docs): refresh_token when we
+  // hold one; otherwise client_credentials re-mint with the stored client
+  // id/secret (M2M-only OAuth servers never issue refresh tokens).
+  const tokenBody = refresh.refreshToken
+    ? new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refresh.refreshToken,
+        client_id: refresh.clientId || "open-managed-agents",
+      })
+    : new URLSearchParams({
+        grant_type: "client_credentials",
+        client_id: refresh.clientId || "open-managed-agents",
+      });
+  if (!refresh.refreshToken && refresh.scope) tokenBody.set("scope", refresh.scope);
   if (refresh.clientSecret) tokenBody.set("client_secret", refresh.clientSecret);
 
   let res: Response;
