@@ -54,17 +54,22 @@ async function setMaxTokensFetch(url: RequestInfo | URL, init?: RequestInit): Pr
  * Without this we only see indirect signals (model_first_token + no
  * model_request_end → "stalled stream"), which conflates rate limiting
  * with real model slowness, network issues, or provider hangs.
+ *
+ * timeoutMs is a hard cap on the whole HTTP exchange (including streaming
+ * body). Without it a silent provider stream hangs the SessionDO
+ * indefinitely. Flex-tier attempts pass a longer cap — see createOaiFetch.
  */
-async function observingFetch(url: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+async function observingFetch(
+  url: RequestInfo | URL,
+  init?: RequestInit,
+  timeoutMs = 5 * 60_000,
+): Promise<Response> {
   const startedAt = Date.now();
   const method = init?.method ?? "GET";
   const urlStr = typeof url === "string" ? url : url instanceof URL ? url.toString() : url.url;
-  // 5min hard timeout on the whole HTTP exchange (including streaming body).
-  // Without it a silent provider stream hangs the SessionDO indefinitely.
-  const TIMEOUT_MS = 5 * 60_000;
   const signal = init?.signal
-    ? AbortSignal.any([init.signal, AbortSignal.timeout(TIMEOUT_MS)])
-    : AbortSignal.timeout(TIMEOUT_MS);
+    ? AbortSignal.any([init.signal, AbortSignal.timeout(timeoutMs)])
+    : AbortSignal.timeout(timeoutMs);
   let res: Response;
   try {
     res = await globalThis.fetch(url, { ...init, signal });
@@ -111,6 +116,140 @@ function useOpenAI(compat: ApiCompat): boolean {
   return compat === "oai" || compat === "oai-compatible";
 }
 
+// --- OpenAI flex service tier -----------------------------------------------
+//
+// Opt-in per model card by suffixing the card's `model` string with ":flex"
+// (e.g. "openai/gpt-5.6-terra:flex"). The suffix is OMA-local: it is stripped
+// before any request, so the provider only ever sees the clean model id.
+// Flex halves OpenAI token pricing on synchronous chat/completions (and
+// passes through gateways like OpenRouter), at the cost of queueing: under
+// load a flex request waits server-side before it is scheduled, and may be
+// rejected with an uncharged capacity 429 ("resource unavailable").
+//
+// Failsafe: every flex attempt automatically falls back to the standard tier
+// when it is not scheduled in time, errors, or returns a capacity 429 — the
+// caller (the AI SDK loop) just sees a normal response. After a flex failure
+// we skip flex entirely for a cooldown window so a long agent loop doesn't
+// pay the schedule timeout on every turn.
+const FLEX_MODEL_SUFFIX = ":flex";
+// Response headers arrive when the provider starts processing, so the wait
+// for headers ≈ the flex queue time. Give up and fall back after this long.
+const FLEX_SCHEDULE_TIMEOUT_MS = 3 * 60_000;
+// Cap on the whole scheduled flex exchange (queue + stream) — flex also
+// streams slower than standard, so the default 5-min guard is too tight.
+const FLEX_TOTAL_TIMEOUT_MS = 10 * 60_000;
+const FLEX_FAILURE_COOLDOWN_MS = 10 * 60_000;
+
+// Isolate-wide, deliberately: one flex outage should pause flex for every
+// concurrent session in this worker, not be rediscovered per session.
+let flexCooldownUntil = 0;
+
+/** Test hook: clear the flex failure cooldown. */
+export function _resetFlexCooldown(): void {
+  flexCooldownUntil = 0;
+}
+
+interface FlexTimeouts {
+  scheduleMs?: number;
+  totalMs?: number;
+  cooldownMs?: number;
+}
+
+/**
+ * Fetch wrapper for the OpenAI-compat path. Always: caps max_tokens when the
+ * harness didn't set one. Two reasons:
+ *  (1) gateways that reserve credits per in-flight request (OpenRouter)
+ *      size the reservation from worst-case output — uncapped 1M-context
+ *      reasoning models reserve dollars per call and starve concurrent
+ *      sessions into 402s long before actual spend reaches the balance;
+ *  (2) a runaway generation is bounded. 16k is ample for tool-call turns
+ *      and final reports.
+ * With flexTier: attempts service_tier:"flex" first, falling back to the
+ * standard tier as described above.
+ */
+export function createOaiFetch(flexTier: boolean, timeouts: FlexTimeouts = {}) {
+  const scheduleMs = timeouts.scheduleMs ?? FLEX_SCHEDULE_TIMEOUT_MS;
+  const totalMs = timeouts.totalMs ?? FLEX_TOTAL_TIMEOUT_MS;
+  const cooldownMs = timeouts.cooldownMs ?? FLEX_FAILURE_COOLDOWN_MS;
+
+  return async (url: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    let body: Record<string, unknown> | null = null;
+    if (init?.body && typeof init.body === "string") {
+      try {
+        body = JSON.parse(init.body) as Record<string, unknown>;
+      } catch {
+        /* non-JSON body — leave untouched */
+      }
+    }
+    if (body && body.max_tokens == null && body.max_completion_tokens == null) {
+      body.max_tokens = 16384;
+    }
+    if (body) init = { ...init, body: JSON.stringify(body) };
+
+    if (!flexTier || !body || Date.now() < flexCooldownUntil) {
+      return observingFetch(url, init);
+    }
+
+    const ctrl = new AbortController();
+    const flexSignal = init?.signal ? AbortSignal.any([init.signal, ctrl.signal]) : ctrl.signal;
+    const attempt = observingFetch(
+      url,
+      { ...init, body: JSON.stringify({ ...body, service_tier: "flex" }), signal: flexSignal },
+      totalMs,
+    );
+    let scheduleTimer: ReturnType<typeof setTimeout> | undefined;
+    const TIMED_OUT = Symbol("flex-schedule-timeout");
+    const outcome = await Promise.race([
+      attempt.then(
+        (res) => ({ res }),
+        (err: unknown) => ({ err: err instanceof Error ? err : new Error(String(err)) }),
+      ),
+      new Promise<typeof TIMED_OUT>((resolve) => {
+        scheduleTimer = setTimeout(() => resolve(TIMED_OUT), scheduleMs);
+      }),
+    ]);
+    clearTimeout(scheduleTimer);
+
+    if (outcome === TIMED_OUT) {
+      ctrl.abort();
+      attempt.catch(() => {});
+      flexCooldownUntil = Date.now() + cooldownMs;
+      console.warn(
+        `[provider.flex] not scheduled within ${scheduleMs}ms — falling back to standard tier (flex paused ${cooldownMs}ms)`,
+      );
+      return observingFetch(url, init);
+    }
+    if ("err" in outcome) {
+      // The caller itself aborted — propagate instead of burning a retry.
+      if (init?.signal?.aborted) throw outcome.err;
+      flexCooldownUntil = Date.now() + cooldownMs;
+      console.warn(
+        `[provider.flex] attempt failed (${outcome.err.message}) — falling back to standard tier`,
+      );
+      return observingFetch(url, init);
+    }
+    const res = outcome.res;
+    if (res.status === 429) {
+      // Distinguish flex capacity rejection (uncharged; retry on standard is
+      // the documented remedy) from a genuine rate limit (pass through so the
+      // SDK's backoff applies).
+      let preview = "";
+      try {
+        preview = (await res.clone().text()).slice(0, 300);
+      } catch {}
+      if (/resource[\s_]?unavailable|capacity|service[\s_]?tier/i.test(preview)) {
+        try {
+          await res.body?.cancel();
+        } catch {}
+        flexCooldownUntil = Date.now() + cooldownMs;
+        console.warn("[provider.flex] capacity 429 — falling back to standard tier");
+        return observingFetch(url, init);
+      }
+    }
+    return res;
+  };
+}
+
 export function resolveModel(
   model: string | { id: string; speed?: "standard" | "fast" },
   apiKey: string,
@@ -128,32 +267,17 @@ export function resolveModel(
   const effectiveCompat = compat || "ant";
 
   if (useOpenAI(effectiveCompat)) {
-    // Cap max_tokens when the harness didn't set one. Two reasons:
-    // (1) gateways that reserve credits per in-flight request (OpenRouter)
-    //     size the reservation from worst-case output — uncapped 1M-context
-    //     reasoning models reserve dollars per call and starve concurrent
-    //     sessions into 402s long before actual spend reaches the balance;
-    // (2) a runaway generation is bounded. 16k is ample for tool-call turns
-    //     and final reports.
-    const capMaxTokensFetch = async (url: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-      if (init?.body && typeof init.body === "string") {
-        try {
-          const body = JSON.parse(init.body);
-          if (body.max_tokens == null && body.max_completion_tokens == null) {
-            body.max_tokens = 16384;
-            init = { ...init, body: JSON.stringify(body) };
-          }
-        } catch {
-          /* non-JSON body — leave untouched */
-        }
-      }
-      return observingFetch(url, init);
-    };
+    let oaiModelId = modelId;
+    let flexTier = false;
+    if (oaiModelId.endsWith(FLEX_MODEL_SUFFIX)) {
+      flexTier = true;
+      oaiModelId = oaiModelId.slice(0, -FLEX_MODEL_SUFFIX.length);
+    }
     const openai = createOpenAI({
       apiKey,
       baseURL: baseURL || undefined,
       headers: customHeaders,
-      fetch: capMaxTokensFetch,
+      fetch: createOaiFetch(flexTier),
     });
     // Use chat/completions endpoint, not Responses API.
     // Reasons:
@@ -163,7 +287,7 @@ export function resolveModel(
     //     orgs with Zero Data Retention enabled get "Item with id 'fc_...' not
     //     found" errors mid-loop
     //   - chat/completions is the de-facto standard contract for OpenAI-compat
-    return openai.chat(modelId);
+    return openai.chat(oaiModelId);
   }
 
   // ant / ant-compatible
