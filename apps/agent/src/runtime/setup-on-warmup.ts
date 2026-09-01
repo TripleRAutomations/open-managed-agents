@@ -206,7 +206,10 @@ async function runScriptDetached(
   const LOG = "/tmp/.oma-setup.log";
   await exec(`cat > ${SH} <<'OMA_SETUP_SCRIPT_EOF'\n${script}\nOMA_SETUP_SCRIPT_EOF`, 15_000);
   await exec(
-    `rm -f ${DONE}; nohup sh -c 'sh ${SH} > ${LOG} 2>&1; echo $? > ${DONE}' >/dev/null 2>&1 & echo launched`,
+    // sh -e: a failing section must fail the whole script — otherwise a
+    // mid-script apt error is masked by the last line's exit 0, markers get
+    // written, and the container is treated as provisioned forever.
+    `rm -f ${DONE}; nohup sh -c 'sh -e ${SH} > ${LOG} 2>&1; echo $? > ${DONE}' >/dev/null 2>&1 & echo launched`,
     15_000,
   );
   const deadline = Date.now() + timeoutMs;
