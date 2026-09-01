@@ -246,6 +246,27 @@ export function createOaiFetch(flexTier: boolean, timeouts: FlexTimeouts = {}) {
         return observingFetch(url, init);
       }
     }
+    // Gateways (OpenRouter) can also signal upstream rate limiting as
+    // HTTP 200 with a JSON error envelope instead of an SSE stream —
+    // {"error":{"code":429,"message":"...rate-limited upstream..."}}.
+    // The SDK parses that as an EMPTY stream: zero tokens, no exception,
+    // and the agent turn silently produces nothing. Detect the envelope
+    // and retry on the standard tier.
+    const ct = res.headers.get("content-type") ?? "";
+    if (res.ok && ct.includes("application/json")) {
+      let preview = "";
+      try {
+        preview = (await res.clone().text()).slice(0, 500);
+      } catch {}
+      if (/"error"/.test(preview) && /429|rate.?limit/i.test(preview)) {
+        try {
+          await res.body?.cancel();
+        } catch {}
+        flexCooldownUntil = Date.now() + cooldownMs;
+        console.warn("[provider.flex] 200-with-error envelope (upstream rate limit) — falling back to standard tier");
+        return observingFetch(url, init);
+      }
+    }
     return res;
   };
 }

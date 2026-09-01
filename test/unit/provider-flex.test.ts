@@ -134,3 +134,35 @@ describe("createOaiFetch — flex tier", () => {
     expect(calls).toHaveLength(1);
   });
 });
+
+describe("createOaiFetch — 200-with-error envelope", () => {
+  it("falls back to standard when flex returns HTTP 200 carrying a rate-limit error body", async () => {
+    mockFetch((body) => {
+      if (body.service_tier === "flex") {
+        return new Response(
+          JSON.stringify({ error: { code: 429, message: "model is temporarily rate-limited upstream. Please retry shortly" } }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return okResponse();
+    });
+    const f = createOaiFetch(true);
+    const res = await f(URL_, req({ model: "m", messages: [] }));
+    expect(res.status).toBe(200);
+    expect(calls).toHaveLength(2);
+    expect(calls[0].service_tier).toBe("flex");
+    expect(calls[1].service_tier).toBeUndefined();
+  });
+
+  it("does not misfire on a normal JSON completion", async () => {
+    mockFetch(() =>
+      new Response(JSON.stringify({ choices: [{ message: { content: "hello, no rate limit here" } }] }), {
+        status: 200, headers: { "content-type": "application/json" },
+      }),
+    );
+    const f = createOaiFetch(true);
+    const res = await f(URL_, req({ model: "m", messages: [] }));
+    expect(res.status).toBe(200);
+    expect(calls).toHaveLength(1);
+  });
+});
