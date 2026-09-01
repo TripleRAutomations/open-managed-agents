@@ -289,6 +289,28 @@ function jsonSchemaPropertyToZod(prop: Record<string, unknown>): z.ZodTypeAny {
 }
 
 /**
+ * Whether a remote MCP tool is enabled by the agent's `mcp_toolset` config
+ * for that server. AMA semantics: a per-tool `configs[].enabled` wins;
+ * otherwise the toolset's `default_config.enabled` (default true); a server
+ * with no mcp_toolset entry at all is fully enabled.
+ */
+export function mcpToolEnabled(
+  agentConfig: AgentConfig,
+  serverName: string,
+  toolName: string,
+): boolean {
+  for (const t of agentConfig.tools ?? []) {
+    if (t.type !== "mcp_toolset") continue;
+    const ts = t as ToolsetConfig & { mcp_server_name?: string };
+    if (ts.mcp_server_name !== serverName) continue;
+    const cfg = ts.configs?.find((c) => c.name === toolName);
+    if (cfg !== undefined) return !!cfg.enabled;
+    return ts.default_config?.enabled ?? true;
+  }
+  return true;
+}
+
+/**
  * Resolve the permission policy for a given tool name from the agent config.
  * Checks per-tool config first, then falls back to default_config, then "always_allow".
  */
@@ -1180,6 +1202,13 @@ export async function buildTools(
             timeoutPromise,
           ]);
           for (const [toolName, t] of Object.entries(remoteTools)) {
+            // Enforce the agent's mcp_toolset config: a per-tool
+            // { enabled: false } must actually remove the tool, not just
+            // decorate the agent definition. The MCP server advertises its
+            // full tool list to every caller, so this filter is the ONLY
+            // thing standing between an agent and tools it was configured
+            // not to have (e.g. a read-only reviewer vs update_offense).
+            if (!mcpToolEnabled(agentConfig, server.name, toolName)) continue;
             tools[`mcp__${server.name}__${toolName}`] = t;
           }
         } catch (err) {
