@@ -4796,6 +4796,21 @@ export class SessionDO extends DurableObject<Env> {
       // For errors that escaped the boundaries (D1, KV, future SDKs),
       // run classifyExternalError once more inline as belt-and-braces.
       const classified = classifyExternalError(err);
+      // Surface the first stack frames in-band: a bare "Cannot read
+      // properties of undefined" reschedule reason is undebuggable in
+      // production (console/tail are blind to SessionDO), and this catch
+      // is the last place the stack still exists.
+      try {
+        const stack = err instanceof Error && err.stack
+          ? err.stack.split("\n").slice(0, 5).join(" | ").slice(0, 600)
+          : "";
+        if (stack) {
+          this.persistAndBroadcastEvent({
+            type: "session.warning",
+            message: `turn_error_stack ${stack}`,
+          } as unknown as SessionEvent);
+        }
+      } catch {}
       const isFatal =
         classified instanceof BillingError ||
         classified instanceof ConfigError ||
