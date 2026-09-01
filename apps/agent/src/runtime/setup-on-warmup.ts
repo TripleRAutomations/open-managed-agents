@@ -207,7 +207,19 @@ export async function ensureSetupApplied(
   const fHash = fullHash(packages);
   const lHash = langHash(packages);
 
-  const state = await probeSetupState(sandbox.exec, fHash, lHash);
+  let state = await probeSetupState(sandbox.exec, fHash, lHash);
+
+  // "restored" trusts that the /workspace backup brought the lang packages
+  // back with the marker — but a backup taken mid-setup (or a partial
+  // restore) can carry the marker without the venv, and the apt-only path
+  // would then skip pip forever. Verify the interpreter actually exists
+  // before taking the fast path; otherwise run full setup.
+  if (state === "restored" && (packages?.pip?.length ?? 0) > 0) {
+    const raw = await sandbox
+      .exec(`[ -x /workspace/.venv/bin/python ] && echo VENV_OK || echo VENV_MISSING`, 15_000)
+      .catch(() => "exit=1\nVENV_MISSING");
+    if (!parseExec(raw).stdout.includes("VENV_OK")) state = "fresh";
+  }
 
   if (state === "warm") {
     onProgress?.({ kind: "done", path: "warm", durationMs: Date.now() - startMs });

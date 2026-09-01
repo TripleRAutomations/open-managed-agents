@@ -465,6 +465,13 @@ export async function buildTools(
       execute: safe(async ({ command, timeout }) => {
         const timeoutMs = Math.min(timeout || DEFAULT_BASH_TIMEOUT, MAX_BASH_TIMEOUT);
 
+        // Environment packages install into /workspace (pip → .venv, npm →
+        // .npm-global, ...) and setup writes /workspace/.oma-env with the
+        // PATH exports — but nothing sourced it, so agent shells saw the
+        // system interpreters and none of the environment's packages.
+        // Source it for every command when present.
+        command = `[ -f /workspace/.oma-env ] && . /workspace/.oma-env >/dev/null 2>&1; ${command}`;
+
         // Auto-background-on-timeout was REMOVED 2026-05-13. The
         // explicit `run_in_background` flag is gone too. Both surfaced
         // a synthetic <task_notification> as user.message via
