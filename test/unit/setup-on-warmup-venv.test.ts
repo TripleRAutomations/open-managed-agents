@@ -11,7 +11,9 @@ import { ensureSetupApplied } from "../../apps/agent/src/runtime/setup-on-warmup
 const PKGS = { pip: ["weasyprint", "markdown"], apt: ["pandoc"] };
 
 // Build an exec fake. `hasVenv` controls the venv probe; markers are set so
-// probeSetupState lands on "restored". Records every command.
+// probeSetupState lands on "restored". Records every command. Setup scripts
+// now run detached (write script → nohup → poll a done file); the fake
+// reports immediate success for the poll.
 function fakeExec(opts: { hasVenv: boolean; restMarker: string }) {
   const commands: string[] = [];
   const exec = async (cmd: string): Promise<string> => {
@@ -21,6 +23,9 @@ function fakeExec(opts: { hasVenv: boolean; restMarker: string }) {
     }
     if (cmd.includes("/workspace/.venv/bin/python")) {
       return `exit=0\n${opts.hasVenv ? "VENV_OK" : "VENV_MISSING"}`;
+    }
+    if (cmd.includes("cat /tmp/.oma-setup.done")) {
+      return "exit=0\n0";
     }
     return "exit=0\n";
   };
@@ -34,6 +39,7 @@ async function learnLangHash(): Promise<string> {
   let written = "";
   const exec = async (cmd: string): Promise<string> => {
     if (cmd.includes("WARM=$(cat")) return "exit=0\nWARM=MISSING\nREST=MISSING";
+    if (cmd.includes("cat /tmp/.oma-setup.done")) return "exit=0\n0";
     const m = cmd.match(/echo "(\w+)" > \/workspace\/\.oma-setup-restored/);
     if (m) written = m[1];
     return "exit=0\n";

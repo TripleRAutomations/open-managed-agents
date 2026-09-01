@@ -188,6 +188,46 @@ function fullHash(packages: PackageList | undefined): string {
 }
 
 /**
+ * Run a (potentially minutes-long) setup script without any single exec
+ * exceeding the ~10-15s budget the sandbox SDK's blockConcurrencyWhile
+ * wrapper allows: write the script to a file, launch it detached with
+ * nohup, then poll its completion marker with short execs. A raw long
+ * exec here gets CANCELLED by the runtime mid-install — which is how
+ * environment apt packages silently never installed (uv pip usually
+ * squeaked under the budget; `apt-get update && install` never did).
+ */
+async function runScriptDetached(
+  exec: ExecLike,
+  script: string,
+  timeoutMs: number,
+): Promise<{ exitCode: number; tail: string }> {
+  const SH = "/tmp/.oma-setup.sh";
+  const DONE = "/tmp/.oma-setup.done";
+  const LOG = "/tmp/.oma-setup.log";
+  await exec(`cat > ${SH} <<'OMA_SETUP_SCRIPT_EOF'\n${script}\nOMA_SETUP_SCRIPT_EOF`, 15_000);
+  await exec(
+    `rm -f ${DONE}; nohup sh -c 'sh ${SH} > ${LOG} 2>&1; echo $? > ${DONE}' >/dev/null 2>&1 & echo launched`,
+    15_000,
+  );
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 3000));
+    const raw = await exec(`cat ${DONE} 2>/dev/null || echo RUNNING`, 15_000).catch(() => "exit=0\nRUNNING");
+    const out = parseExec(raw).stdout.trim();
+    if (out !== "RUNNING" && out !== "") {
+      const exitCode = parseInt(out, 10);
+      let tail = "";
+      if (exitCode !== 0) {
+        const t = await exec(`tail -c 400 ${LOG} 2>/dev/null`, 15_000).catch(() => "exit=0\n");
+        tail = parseExec(t).stdout;
+      }
+      return { exitCode: Number.isNaN(exitCode) ? -1 : exitCode, tail };
+    }
+  }
+  return { exitCode: -1, tail: `setup script still running after ${timeoutMs}ms` };
+}
+
+/**
  * Main entry point. Replaces SessionDO's inline package install loop.
  *
  * Called from doWarmUpSandbox AFTER container is ready AND workspace
@@ -230,13 +270,12 @@ export async function ensureSetupApplied(
     onProgress?.({ kind: "step", step: "reinstalling_apt" });
     const aptScript = buildAptScript(packages?.apt);
     if (aptScript) {
-      const raw = await sandbox.exec(`set +e; ${aptScript}`, 180_000);
-      const r = parseExec(raw);
+      const r = await runScriptDetached(sandbox.exec, aptScript, 300_000);
       if (r.exitCode !== 0) {
         return {
           path: "restored",
           durationMs: Date.now() - startMs,
-          error: `apt_install_failed exit=${r.exitCode}: ${(r.stderr || r.stdout || "").slice(-300)}`,
+          error: `apt_install_failed exit=${r.exitCode}: ${r.tail.slice(-300)}`,
         };
       }
     }
@@ -251,13 +290,12 @@ export async function ensureSetupApplied(
   onProgress?.({ kind: "step", step: "running_setup" });
   const fullScript = buildFullSetupScript(packages);
   if (fullScript) {
-    const raw = await sandbox.exec(`set +e; ${fullScript}`, 600_000);
-    const r = parseExec(raw);
+    const r = await runScriptDetached(sandbox.exec, fullScript, 600_000);
     if (r.exitCode !== 0) {
       return {
         path: "fresh",
         durationMs: Date.now() - startMs,
-        error: `full_setup_failed exit=${r.exitCode}: ${(r.stderr || r.stdout || "").slice(-300)}`,
+        error: `full_setup_failed exit=${r.exitCode}: ${r.tail.slice(-300)}`,
       };
     }
   }

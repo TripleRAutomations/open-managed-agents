@@ -3055,8 +3055,16 @@ export class SessionDO extends DurableObject<Env> {
           if (result.error) {
             console.error(`[setup-on-warmup] failed path=${result.path}: ${result.error}`);
             // Don't throw — the agent can still try to run with whatever
-            // packages survived. Surfaced via tool exec failure if a
-            // missing dep is needed.
+            // packages survived. But surface in-band: console is invisible
+            // in production (tail is blind to SessionDO), and a silently
+            // half-provisioned environment looks exactly like a healthy
+            // one until an agent needs the missing package.
+            try {
+              this.persistAndBroadcastEvent({
+                type: "session.warning",
+                message: `env_setup_failed path=${result.path} error=${result.error.slice(0, 300)}`,
+              } as unknown as SessionEvent);
+            } catch {}
           }
         }
       }
