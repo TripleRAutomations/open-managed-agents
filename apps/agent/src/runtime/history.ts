@@ -574,10 +574,18 @@ function pickPreservedTail(
  * Strict inverse of normalizeToolOutputForWire in default-loop.ts.
  */
 function wireContentToToolOutput(
-  content: string | ContentBlock[],
+  content: string | ContentBlock[] | undefined | null,
 ): { type: "text"; value: string } | { type: "content"; value: any[] } {
   if (typeof content === "string") {
     return { type: "text", value: content };
+  }
+  // A tool-result event can be persisted with no content at all (seen in
+  // production from an MCP error shape). History replay must tolerate it:
+  // one malformed stored event otherwise poisons the session forever —
+  // every subsequent turn crashes in eventsToMessages before the model is
+  // even called, and the session can only error until it is abandoned.
+  if (!Array.isArray(content)) {
+    return { type: "text", value: content == null ? "" : JSON.stringify(content) };
   }
   return {
     type: "content",
