@@ -139,6 +139,11 @@ const FLEX_SCHEDULE_TIMEOUT_MS = 3 * 60_000;
 // streams slower than standard, so the default 5-min guard is too tight.
 const FLEX_TOTAL_TIMEOUT_MS = 10 * 60_000;
 const FLEX_FAILURE_COOLDOWN_MS = 10 * 60_000;
+// How long to wait for the first SSE data event when sniffing for an
+// in-stream rate-limit error. Error events arrive within ~3s; a healthy flex
+// stream may legitimately take longer to start (queueing) — then we stop
+// peeking and pass the stream through untouched.
+const FLEX_SSE_PEEK_MS = 8_000;
 
 // Isolate-wide, deliberately: one flex outage should pause flex for every
 // concurrent session in this worker, not be rediscovered per session.
@@ -153,6 +158,7 @@ interface FlexTimeouts {
   scheduleMs?: number;
   totalMs?: number;
   cooldownMs?: number;
+  peekMs?: number;
 }
 
 /**
@@ -171,6 +177,7 @@ export function createOaiFetch(flexTier: boolean, timeouts: FlexTimeouts = {}) {
   const scheduleMs = timeouts.scheduleMs ?? FLEX_SCHEDULE_TIMEOUT_MS;
   const totalMs = timeouts.totalMs ?? FLEX_TOTAL_TIMEOUT_MS;
   const cooldownMs = timeouts.cooldownMs ?? FLEX_FAILURE_COOLDOWN_MS;
+  const peekMs = timeouts.peekMs ?? FLEX_SSE_PEEK_MS;
 
   return async (url: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     let body: Record<string, unknown> | null = null;
@@ -267,8 +274,66 @@ export function createOaiFetch(flexTier: boolean, timeouts: FlexTimeouts = {}) {
         return observingFetch(url, init);
       }
     }
+    // SSE variant of the same failure: OpenRouter can also deliver the
+    // upstream rate-limit as the FIRST (and only) event of a text/event-stream
+    // response — {"choices":[],"error":{"code":429,...}} then [DONE]. The SDK
+    // ends the stream with finish_reason "other" and zero output. Peek at the
+    // first data event before handing the stream to the SDK.
+    const sse = res.ok && ct.includes("text/event-stream") && res.body;
+    if (sse) {
+      const [peek, pass] = res.body!.tee();
+      const verdict = await peekSseForError(peek, peekMs);
+      if (verdict === "rate_limited") {
+        try { await pass.cancel(); } catch {}
+        flexCooldownUntil = Date.now() + cooldownMs;
+        console.warn("[provider.flex] SSE error event (upstream rate limit) — falling back to standard tier");
+        return observingFetch(url, init);
+      }
+      return new Response(pass, { status: res.status, statusText: res.statusText, headers: res.headers });
+    }
     return res;
   };
+}
+
+/**
+ * Read the first SSE data event (skipping ": OPENROUTER PROCESSING" keepalive
+ * comments) within `maxMs`. Returns "rate_limited" when it is an error event
+ * carrying a 429 / rate-limit message, "ok" for a normal chunk, and
+ * "unknown" when nothing arrived in time (genuine flex queueing — let the
+ * stream through untouched).
+ */
+export async function peekSseForError(
+  stream: ReadableStream<Uint8Array>,
+  maxMs: number,
+): Promise<"rate_limited" | "ok" | "unknown"> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  const deadline = Date.now() + maxMs;
+  try {
+    while (Date.now() < deadline) {
+      const remaining = deadline - Date.now();
+      const next = await Promise.race([
+        reader.read(),
+        new Promise<null>((r) => setTimeout(() => r(null), remaining)),
+      ]);
+      if (next === null) break;
+      if (next.done) break;
+      buf += decoder.decode(next.value, { stream: true });
+      const dataLine = buf.split("\n").find((l) => l.startsWith("data:") && l.trim() !== "data: [DONE]");
+      if (dataLine) {
+        const payload = dataLine.slice(5).trim();
+        if (/"error"\s*:/.test(payload) && /429|rate.?limit/i.test(payload)) return "rate_limited";
+        return "ok";
+      }
+      if (buf.length > 64_000) return "ok";
+    }
+  } catch {
+    /* treat as unknown */
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+  return "unknown";
 }
 
 export function resolveModel(

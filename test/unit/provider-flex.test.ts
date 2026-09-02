@@ -166,3 +166,29 @@ describe("createOaiFetch — 200-with-error envelope", () => {
     expect(calls).toHaveLength(1);
   });
 });
+
+describe("createOaiFetch — SSE in-stream rate-limit error", () => {
+  function sse(lines: string[]): Response {
+    return new Response(lines.join("\n") + "\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+  it("falls back to standard when the first SSE event is a 429 error", async () => {
+    mockFetch((body) => {
+      if (body.service_tier === "flex") {
+        return sse([": OPENROUTER PROCESSING", "", 'data: {"id":"gen-1","choices":[],"error":{"code":429,"message":"model is temporarily rate-limited upstream"}}', "", "data: [DONE]"]);
+      }
+      return okResponse();
+    });
+    const f = createOaiFetch(true, { peekMs: 500 });
+    const res = await f(URL_, req({ model: "m", messages: [] }));
+    expect(res.status).toBe(200);
+    expect(calls).toHaveLength(2);
+    expect(calls[1].service_tier).toBeUndefined();
+  });
+  it("passes a healthy SSE stream through intact", async () => {
+    mockFetch(() => sse([": OPENROUTER PROCESSING", "", 'data: {"id":"gen-2","choices":[{"delta":{"content":"OK"}}]}', "", "data: [DONE]"]));
+    const f = createOaiFetch(true, { peekMs: 500 });
+    const res = await f(URL_, req({ model: "m", messages: [] }));
+    expect(calls).toHaveLength(1);
+    expect(await res.text()).toContain('"content":"OK"');
+  });
+});
