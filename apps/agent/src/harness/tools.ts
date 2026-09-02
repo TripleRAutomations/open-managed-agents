@@ -207,6 +207,44 @@ function truncateResult(result: string): string {
   return result;
 }
 
+// Remote MCP results are not bounded by anything: a single run_select can
+// return ~1 MB (a full knowledge-table dump), which is persisted to the
+// event log (D1 write timeouts) and held in the SessionDO (evictions), and
+// then replayed into every later model turn. Built-in tools already cap at
+// MAX_TOOL_RESULT_CHARS; apply a (larger) cap to MCP text results too.
+const MAX_MCP_RESULT_CHARS = 150_000;
+
+export function truncateMcpResult(result: unknown): unknown {
+  const cut = (text: string) =>
+    text.length > MAX_MCP_RESULT_CHARS
+      ? text.slice(0, MAX_MCP_RESULT_CHARS) +
+        `\n...(truncated by the platform, total ${text.length} chars - narrow the query: select fewer columns/rows)`
+      : text;
+  if (typeof result === "string") return cut(result);
+  if (result && typeof result === "object" && Array.isArray((result as { content?: unknown }).content)) {
+    const r = result as { content: Array<{ type?: string; text?: string }> };
+    let budget = MAX_MCP_RESULT_CHARS;
+    const content = r.content.map((part) => {
+      if (part && part.type === "text" && typeof part.text === "string") {
+        const text = part.text.length > budget ? cut(part.text.slice(0, Math.max(budget, 0)) + part.text.slice(Math.max(budget, 0))) : part.text;
+        budget -= Math.min(part.text.length, budget);
+        return { ...part, text };
+      }
+      return part;
+    });
+    return { ...r, content };
+  }
+  return result;
+}
+
+/** Wrap a remote MCP tool so its results pass through truncateMcpResult. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function capMcpToolResult(t: any): any {
+  if (!t || typeof t.execute !== "function") return t;
+  const execute = t.execute.bind(t);
+  return { ...t, execute: async (...args: unknown[]) => truncateMcpResult(await execute(...args)) };
+}
+
 /** Shell-quote an argument safely (POSIX single-quote escaping). */
 function shellQuote(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
@@ -1216,7 +1254,7 @@ export async function buildTools(
             // thing standing between an agent and tools it was configured
             // not to have (e.g. a read-only reviewer vs update_offense).
             if (!mcpToolEnabled(agentConfig, server.name, toolName)) continue;
-            tools[`mcp__${server.name}__${toolName}`] = t;
+            tools[`mcp__${server.name}__${toolName}`] = capMcpToolResult(t);
           }
         } catch (err) {
           // Connection / handshake / tools/list failure for one server
