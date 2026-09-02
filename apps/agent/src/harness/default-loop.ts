@@ -756,6 +756,28 @@ export class DefaultHarness implements HarnessInterface {
           `silent_stop: model returned finish_reason=${finishReason} with empty text and no tool calls`,
         );
       }
+      // Empty-response detection for the OTHER finish reasons: the provider
+      // (or a gateway in front of it) ended the stream with no content, no
+      // tool calls and no tokens — finish_reason "other"/"error".
+      // Seen live (OpenRouter upstream rate limit delivered inside a 200
+      // event-stream): the turn silently "completed", the coordinator went
+      // idle, and the scheduled pass was lost. Unlike silent_stop this is
+      // NOT deterministic per prompt, so throw a plain (transient) error:
+      // processUserMessage retries it and the reschedule reason makes the
+      // empty response visible in the event log.
+      if (
+        (finishReason === "other" || finishReason === "error")
+        && (!finalText || finalText.trim().length === 0)
+        && (!toolCalls || toolCalls.length === 0)
+      ) {
+        if (currentMessageId) {
+          await runtime.broadcastStreamEnd(currentMessageId, "aborted", "empty_response");
+        }
+        const inTok = (usage as { inputTokens?: number } | undefined)?.inputTokens ?? 0;
+        throw new Error(
+          `empty_response: model stream ended with finish_reason=${finishReason}, no text, no tool calls, input_tokens=${inTok} (provider/gateway returned nothing — retrying)`,
+        );
+      }
       return { finishReason, text: finalText, toolCalls, toolResults, usage };
       } catch (err) {
         // Boundary: streamText + the read awaits above (finishReason /
