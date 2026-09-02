@@ -21,7 +21,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6.0.9
+        uses: pnpm/action-setup@v6.0.10
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -38,3 +38,9 @@ jobs:
 
       - name: Test
         run: pnpm test
+
+      - name: Protocol coverage gate
+        run: pnpm test:coverage:protocol
+
+      - name: Storage integration tests
+        run: pnpm test:integration:storage
