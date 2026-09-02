@@ -288,6 +288,10 @@ app.get("/:id/content", async (c) => {
     return new Response(obj.body, {
       headers: {
         "Content-Type": obj.httpMetadata?.contentType || guessOutputMime(decoded.filename),
+        // Filename on the wire: HTTP clients (n8n, browsers, curl -O) name the
+        // download from Content-Disposition; without it a report.pdf arrives
+        // as a file literally called "content" and mail clients cannot preview it.
+        "Content-Disposition": `inline; filename="${decoded.filename.replace(/["\r\n]/g, "_")}"`,
       },
     });
   }
@@ -305,7 +309,10 @@ app.get("/:id/content", async (c) => {
   if (!obj) return c.json({ error: "File content not found" }, 404);
 
   return new Response(obj.body, {
-    headers: { "Content-Type": row.media_type },
+    headers: {
+      "Content-Type": row.media_type,
+      "Content-Disposition": `inline; filename="${String((row as { filename?: string }).filename ?? id).replace(/["\r\n]/g, "_")}"`,
+    },
   });
 });
 
