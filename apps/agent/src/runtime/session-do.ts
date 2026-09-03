@@ -4822,7 +4822,14 @@ export class SessionDO extends DurableObject<Env> {
         classified instanceof ModelError;
       const isTransient = !isFatal;
 
-      if (isTransient && retryCount < 2) {
+      // Transient retry budget. Was 2 retries at 1s/2s — fine for a DO
+      // hiccup, useless for a model-gateway episode: 2026-09-03 05:00 the
+      // daily SOC Manager got three empty streams (finish_reason=other,
+      // 0 input tokens) inside 18s, burned the budget and errored with no
+      // report; a deep pass died the same way at 04:03. Gateway outages
+      // last minutes, not seconds, so spread 4 retries over ~2.5 min.
+      const TRANSIENT_RETRY_DELAYS_MS = [5_000, 15_000, 45_000, 90_000];
+      if (isTransient && retryCount < TRANSIENT_RETRY_DELAYS_MS.length) {
         const rescheduledEvent: SessionEvent = {
           type: "session.status_rescheduled",
           reason: errorMessage,
@@ -4830,8 +4837,8 @@ export class SessionDO extends DurableObject<Env> {
         history.append(rescheduledEvent);
         this.broadcastEvent(rescheduledEvent);
 
-        // Exponential backoff: 1s, 2s
-        const delay = 1000 * Math.pow(2, retryCount);
+        // Backoff: 5s, 15s, 45s, 90s
+        const delay = TRANSIENT_RETRY_DELAYS_MS[retryCount];
         await new Promise(r => setTimeout(r, delay));
         // Recursive call owns the next idle emit (success or its own
         // finally). Suppress this frame's catch-all so we don't get
