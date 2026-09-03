@@ -4827,8 +4827,8 @@ export class SessionDO extends DurableObject<Env> {
       // daily SOC Manager got three empty streams (finish_reason=other,
       // 0 input tokens) inside 18s, burned the budget and errored with no
       // report; a deep pass died the same way at 04:03. Gateway outages
-      // last minutes, not seconds, so spread 4 retries over ~2.5 min.
-      const TRANSIENT_RETRY_DELAYS_MS = [5_000, 15_000, 45_000, 90_000];
+      // last minutes, not seconds, so spread 5 retries over ~5.75 min.
+      const TRANSIENT_RETRY_DELAYS_MS = [5_000, 15_000, 45_000, 90_000, 180_000];
       if (isTransient && retryCount < TRANSIENT_RETRY_DELAYS_MS.length) {
         const rescheduledEvent: SessionEvent = {
           type: "session.status_rescheduled",
@@ -4837,7 +4837,7 @@ export class SessionDO extends DurableObject<Env> {
         history.append(rescheduledEvent);
         this.broadcastEvent(rescheduledEvent);
 
-        // Backoff: 5s, 15s, 45s, 90s
+        // Backoff: 5s, 15s, 45s, 90s, 180s
         const delay = TRANSIENT_RETRY_DELAYS_MS[retryCount];
         await new Promise(r => setTimeout(r, delay));
         // Recursive call owns the next idle emit (success or its own
