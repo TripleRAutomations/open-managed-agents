@@ -17,7 +17,7 @@
 // tier or bill it at 50% — that is verified against the live gateway.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { createOaiFetch, _resetFlexCooldown } from "../../apps/agent/src/harness/provider";
+import { createOaiFetch, _resetFlexCooldown, pauseFlex } from "../../apps/agent/src/harness/provider";
 
 const URL_ = "https://openrouter.ai/api/v1/chat/completions";
 
@@ -190,5 +190,35 @@ describe("createOaiFetch — SSE in-stream rate-limit error", () => {
     const res = await f(URL_, req({ model: "m", messages: [] }));
     expect(calls).toHaveLength(1);
     expect(await res.text()).toContain('"content":"OK"');
+  });
+
+  it("pauseFlex sends the next request on the standard tier", async () => {
+    _resetFlexCooldown();
+    const seen: Array<Record<string, unknown>> = [];
+    const upstream = vi.fn(async (_url: string, init: RequestInit) => {
+      seen.push(JSON.parse(init.body as string) as Record<string, unknown>);
+      return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", upstream);
+
+    const doFetch = createOaiFetch(true);
+    await doFetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model: "x", messages: [] }),
+    });
+    expect(seen[0].service_tier).toBe("flex");
+
+    // The harness loop calls this when a stream returns nothing.
+    pauseFlex();
+
+    await doFetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model: "x", messages: [] }),
+    });
+    expect(seen[1].service_tier).toBeUndefined();
+    _resetFlexCooldown();
   });
 });

@@ -150,6 +150,22 @@ const FLEX_SSE_PEEK_MS = 8_000;
 let flexCooldownUntil = 0;
 
 /** Test hook: clear the flex failure cooldown. */
+/**
+ * Pause the flex tier so the next attempt goes out on the standard tier.
+ *
+ * The fetch-level failsafe below catches flex failures that are visible as an
+ * HTTP outcome (schedule timeout, capacity 429, error envelope, SSE error
+ * event). It CANNOT see a stream that opens cleanly, streams nothing, and ends
+ * — that only becomes visible once the SDK has consumed it, in the harness
+ * loop. 2026-09-04: six consecutive no-output streams killed a deep pass and
+ * its claimed offenses were locked, because every retry went back to flex.
+ * The loop now calls this on an empty/no-output turn so the retry lands on the
+ * standard tier instead of re-rolling the same failing path.
+ */
+export function pauseFlex(ms: number = FLEX_FAILURE_COOLDOWN_MS): void {
+  flexCooldownUntil = Date.now() + ms;
+}
+
 export function _resetFlexCooldown(): void {
   flexCooldownUntil = 0;
 }
