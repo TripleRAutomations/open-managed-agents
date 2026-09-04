@@ -8,6 +8,28 @@ import { SummarizeCompactionStrategy, resolveCompactionStrategy } from "./compac
 import type { CompactionStrategy } from "./compaction";
 import { ALL_TOOLS } from "./tools";
 import { pauseFlex } from "./provider";
+
+/**
+ * Did the LAST step of a turn produce nothing?
+ *
+ * `streamText`'s top-level `text` / `toolCalls` aggregate across every step of
+ * a multi-step turn, so a turn that called tools and then died on an empty
+ * model response still reports a non-empty `toolCalls`. Judging emptiness on
+ * the aggregate therefore never fires for an agent turn — which is exactly how
+ * sess-45k053fxvunuoy42 claimed 62 offenses, pulled QRadar metadata for 20 of
+ * them, hit an empty response and was reported as a completed turn.
+ * Exported for tests.
+ */
+export function isEmptyFinalStep(
+  steps: ReadonlyArray<{ text?: string; toolCalls?: unknown[] }> | undefined,
+  fallbackText: string | undefined,
+  fallbackToolCalls: unknown[] | undefined,
+): boolean {
+  const last = steps && steps.length > 0 ? steps[steps.length - 1] : undefined;
+  const text = last ? (last.text ?? "") : (fallbackText ?? "");
+  const calls = last ? (last.toolCalls ?? []) : (fallbackToolCalls ?? []);
+  return text.trim().length === 0 && calls.length === 0;
+}
 import { llmLoggingMiddleware, llmLogKey } from "./llm-logging-middleware";
 
 // Single source of truth lives in ./tools.ts (ALL_TOOLS). Importing here so
@@ -766,10 +788,25 @@ export class DefaultHarness implements HarnessInterface {
       // NOT deterministic per prompt, so throw a plain (transient) error:
       // processUserMessage retries it and the reschedule reason makes the
       // empty response visible in the event log.
+      //
+      // Judge the FINAL STEP, not the accumulated result. `r.text` and
+      // `r.toolCalls` aggregate across every step of a multi-step turn, so on
+      // any turn that called a tool before dying — i.e. essentially every
+      // agent turn — `toolCalls.length` was non-zero and this guard never
+      // fired. 2026-09-04 sess-45k053fxvunuoy42: claimed 62 offenses, read
+      // knowledge, pulled QRadar metadata for 20 of them, then the next model
+      // request came back empty with finish_reason "other"; the turn was
+      // reported as complete, the session went idle 4 s after claiming, and
+      // 62 offenses sat unworked for three hours. Same shape killed the
+      // 02:30 pass the night before.
+      const steps = await r.steps;
       if (
         (finishReason === "other" || finishReason === "error")
-        && (!finalText || finalText.trim().length === 0)
-        && (!toolCalls || toolCalls.length === 0)
+        && isEmptyFinalStep(
+          steps as ReadonlyArray<{ text?: string; toolCalls?: unknown[] }> | undefined,
+          finalText,
+          toolCalls as unknown[] | undefined,
+        )
       ) {
         if (currentMessageId) {
           await runtime.broadcastStreamEnd(currentMessageId, "aborted", "empty_response");
@@ -779,8 +816,9 @@ export class DefaultHarness implements HarnessInterface {
         // goes out on the standard tier rather than re-rolling the same path.
         pauseFlex();
         const inTok = (usage as { inputTokens?: number } | undefined)?.inputTokens ?? 0;
+        const stepCount = Array.isArray(steps) ? steps.length : 0;
         throw new Error(
-          `empty_response: model stream ended with finish_reason=${finishReason}, no text, no tool calls, input_tokens=${inTok} (provider/gateway returned nothing — retrying)`,
+          `empty_response: model stream ended with finish_reason=${finishReason}, final step ${stepCount} produced no text and no tool calls, input_tokens=${inTok} (provider/gateway returned nothing — retrying)`,
         );
       }
       return { finishReason, text: finalText, toolCalls, toolResults, usage };
