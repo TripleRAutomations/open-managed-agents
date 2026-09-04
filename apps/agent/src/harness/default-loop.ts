@@ -7,7 +7,6 @@ import { eventsToMessagesAsync } from "../runtime/history";
 import { SummarizeCompactionStrategy, resolveCompactionStrategy } from "./compaction";
 import type { CompactionStrategy } from "./compaction";
 import { ALL_TOOLS } from "./tools";
-import { pauseFlex } from "./provider";
 
 /**
  * Did the LAST step of a turn produce nothing?
@@ -811,10 +810,6 @@ export class DefaultHarness implements HarnessInterface {
         if (currentMessageId) {
           await runtime.broadcastStreamEnd(currentMessageId, "aborted", "empty_response");
         }
-        // An empty stream is the one flex failure the fetch-level failsafe
-        // cannot see (it opened 200 and ended clean). Pause flex so the retry
-        // goes out on the standard tier rather than re-rolling the same path.
-        pauseFlex();
         const inTok = (usage as { inputTokens?: number } | undefined)?.inputTokens ?? 0;
         const stepCount = Array.isArray(steps) ? steps.length : 0;
         throw new Error(
@@ -823,14 +818,6 @@ export class DefaultHarness implements HarnessInterface {
       }
       return { finishReason, text: finalText, toolCalls, toolResults, usage };
       } catch (err) {
-        // Same reasoning as the empty_response branch: the AI SDK raises
-        // AI_NoOutputGeneratedError for a stream that produced nothing, and it
-        // never reaches the check above. Send the retry to the standard tier.
-        if (/No output generated|empty[_ ]response/i.test(
-          err instanceof Error ? err.message : String(err),
-        )) {
-          pauseFlex();
-        }
         // Boundary: streamText + the read awaits above (finishReason /
         // text / toolCalls / usage) are the LLM-provider edge. Native
         // SDK errors (Anthropic 401/429/5xx, the `silent_stop` Error we

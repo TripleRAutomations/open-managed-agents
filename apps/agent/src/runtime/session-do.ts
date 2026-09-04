@@ -63,7 +63,7 @@ import type {
 import type { HarnessContext, HarnessInterface, HistoryStore, SandboxExecutor, ProcessHandle, FileResolver } from "../harness/interface";
 import { resolveHarness } from "../harness/registry";
 import { composeSystemPrompt } from "../harness/platform-guidance";
-import { resolveModel } from "../harness/provider";
+import { pauseFlex, resolveModel } from "../harness/provider";
 import type { ApiCompat } from "../harness/provider";
 import type { LanguageModel } from "ai";
 import { generateText } from "ai";
@@ -4836,6 +4836,19 @@ export class SessionDO extends DurableObject<Env> {
         };
         history.append(rescheduledEvent);
         this.broadcastEvent(rescheduledEvent);
+
+        // Flex escalation. An empty stream is usually a transient upstream
+        // hiccup and flex is half price, so keep re-rolling flex for the first
+        // FOUR attempts; from the fifth, fall back to the standard tier.
+        // retryCount is the number of retries already made, so retryCount === 3
+        // means attempt 5 is about to go out.
+        const FLEX_ATTEMPTS_BEFORE_STANDARD = 4;
+        if (
+          retryCount >= FLEX_ATTEMPTS_BEFORE_STANDARD - 1
+          && /No output generated|empty[_ ]response/i.test(errorMessage)
+        ) {
+          pauseFlex();
+        }
 
         // Backoff: 5s, 15s, 45s, 90s, 180s
         const delay = TRANSIENT_RETRY_DELAYS_MS[retryCount];
